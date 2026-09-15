@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from collections import Counter
 from difflib import SequenceMatcher
 import re
 from typing import Dict, List, Tuple
 
-from validation.common import first_date_near_keywords, parse_human_date
+from validation.common import parse_human_date
 from validation.thai_id import find_thai_citizen_id, is_valid_thai_citizen_id
 
 THAI_TITLES = ("นางสาว", "เด็กหญิง", "เด็กชาย", "น.ส.", "ด.ญ.", "ด.ช.", "น.ส", "ด.ญ", "ด.ช", "นาย", "นาง")
@@ -43,15 +44,12 @@ def _fuzzy_surname_label(text: str) -> Tuple[bool, str]:
     if not tokens:
         return False, ""
 
-    # Exact-ish one-word Surname remains common.
     if SequenceMatcher(None, tokens[0].lower(), "surname").ratio() >= 0.78:
         return True, " ".join(tokens[1:])
 
     if len(tokens) >= 2:
         head = " ".join(tokens[:2]).lower()
         score = SequenceMatcher(None, head, "last name").ratio()
-        # Real samples include OCR forms such as Last nama, Laut Name, Lart Nems,
-        # Exst zame and Lest saw. Keep this low threshold scoped only to Thai-ID parsing.
         if score >= 0.57:
             return True, " ".join(tokens[2:])
     return False, ""
@@ -83,7 +81,6 @@ def _extract_english_name(texts: List[str]) -> Tuple[str, str]:
             if not given:
                 given = _next_english_value(texts, i)
 
-        # OCR often destroys the word "Name" but preserves the title and actual name.
         if not given:
             title_match = re.search(rf"(?i)\b{EN_TITLE_PATTERN}\s+([A-Za-z][A-Za-z' -]{{1,}})$", text)
             if title_match:
@@ -126,37 +123,82 @@ def _extract_address(texts: List[str]) -> str:
     return ""
 
 
-def _collect_unique_dates(texts: List[str]) -> List[str]:
-    found: List[str] = []
-    for text in texts:
+def _date_observations(texts: List[str]) -> List[Tuple[int, str]]:
+    observations: List[Tuple[int, str]] = []
+    for idx, text in enumerate(texts):
         parsed = parse_human_date(text)
-        if parsed and parsed not in found:
-            found.append(parsed)
-    return found
+        if parsed:
+            observations.append((idx, parsed))
+    return observations
+
+
+def _english_label_score(text: str, target: str) -> float:
+    normalized = re.sub(r"[^a-z]+", " ", (text or "").lower()).strip()
+    if not normalized:
+        return 0.0
+    target = target.lower()
+    if target in normalized:
+        return 1.0
+    tokens = normalized.split()
+    candidates = [normalized]
+    for size in range(2, min(5, len(tokens)) + 1):
+        candidates.append(" ".join(tokens[:size]))
+    return max(SequenceMatcher(None, candidate, target).ratio() for candidate in candidates)
+
+
+def _birth_candidate(texts: List[str], observations: List[Tuple[int, str]]) -> str:
+    counts = Counter(value for _, value in observations)
+    scores: Dict[str, float] = {}
+
+    for idx, value in observations:
+        best = 0.0
+        for nearby in range(max(0, idx - 2), min(len(texts), idx + 3)):
+            distance = abs(nearby - idx)
+            line = texts[nearby]
+            english = _english_label_score(line, "date of birth")
+            thai = 1.0 if any(keyword in line for keyword in ["เกิดวันที่", "วันเกิด", "เกิด"]) else 0.0
+            best = max(best, max(english, thai) - distance * 0.08)
+        if best >= 0.75:
+            scores[value] = max(scores.get(value, 0.0), best)
+
+    if not scores:
+        return ""
+
+    return max(scores, key=lambda value: (counts[value], scores[value]))
 
 
 def _extract_dates(texts: List[str]) -> Tuple[str, str, str]:
-    """Return DOB, issue date, expiry date.
+    """Return DOB, issue date and expiry date using OCR consensus.
 
-    Thai ID OCR frequently emits dates before their labels or in a different visual order.
-    When all three unique dates are visible, chronology is more reliable than OCR list order:
-    birth < issue < expiry.
+    Bilingual Thai IDs frequently expose the same date more than once. Repeated agreement is
+    stronger evidence than a single noisy OCR date, so we rank candidates by observation count.
     """
-    dates = _collect_unique_dates(texts)
-    if len(dates) >= 3:
-        ordered = sorted(dates)
-        return ordered[0], ordered[-2], ordered[-1]
+    observations = _date_observations(texts)
+    if not observations:
+        return "", "", ""
 
-    dob = first_date_near_keywords(texts, ["date of birth", "เกิด", "วันเกิด"]) or ""
-    issue = first_date_near_keywords(texts, ["date of issue", "วันออกบัตร"]) or ""
-    expiry = first_date_near_keywords(texts, ["date of expiry", "expiry", "วันบัตรหมดอายุ"]) or ""
+    counts = Counter(value for _, value in observations)
+    dob = _birth_candidate(texts, observations)
 
-    if len(dates) == 2 and not dob:
-        # If birth is absent, the two complete dates visible near the bottom of an ID
-        # are overwhelmingly the issue and expiry dates. Chronology is safer than OCR order.
-        ordered = sorted(dates)
-        issue, expiry = ordered[0], ordered[1]
-    return dob, issue, expiry
+    if not dob and len(counts) == 2:
+        ordered = sorted(counts)
+        return "", ordered[0], ordered[1]
+
+    remaining: List[Tuple[str, int]] = []
+    for value, count in counts.items():
+        if value == dob:
+            continue
+        if dob and value <= dob:
+            # Reject alternate/misread birth dates that precede the selected DOB.
+            continue
+        remaining.append((value, count))
+
+    if len(remaining) >= 2:
+        strongest = sorted(remaining, key=lambda item: (-item[1], item[0]))[:2]
+        ordered = sorted(value for value, _ in strongest)
+        return dob, ordered[0], ordered[1]
+
+    return dob, "", ""
 
 
 def extract_thai_id(texts: List[str]) -> Tuple[Dict, List[Dict]]:
