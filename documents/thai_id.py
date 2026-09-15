@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Tuple
 
-from validation.common import first_date_near_keywords
+from validation.common import first_date_near_keywords, parse_human_date
 from validation.thai_id import find_thai_citizen_id, is_valid_thai_citizen_id
 
 THAI_TITLES = ("นาย", "นางสาว", "นาง")
@@ -11,27 +11,68 @@ EN_TITLES = ("MR.", "MRS.", "MISS", "MS.", "MR", "MRS", "MS")
 
 
 def _clean_label(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _clean_english_person_value(value: str) -> str:
+    value = _clean_label(value).strip(" :-")
+    value = re.sub(r"(?i)^(Mr\.?|Mrs\.?|Miss|Ms\.?)\s+", "", value).strip()
+    if not value:
+        return ""
+    if re.search(r"\d", value):
+        return ""
+    if any(k in value.lower() for k in ["date of", "identification", "nationality", "address", "expiry", "issue"]):
+        return ""
+    if not re.fullmatch(r"[A-Za-z' -]{2,}", value):
+        return ""
+    return value
+
+
+def _next_english_value(texts: List[str], index: int, max_ahead: int = 2) -> str:
+    for j in range(index + 1, min(len(texts), index + 1 + max_ahead)):
+        candidate = _clean_english_person_value(texts[j])
+        if candidate:
+            return candidate
+    return ""
 
 
 def _extract_english_name(texts: List[str]) -> Tuple[str, str]:
+    given = ""
+    surname = ""
+
     for i, raw in enumerate(texts):
         text = _clean_label(raw)
-        m = re.search(r"(?i)\bName\b[:\s]*((?:Mr\.?|Mrs\.?|Miss|Ms\.?)?\s*[A-Z][A-Za-z' -]{2,})", text)
-        candidate = m.group(1).strip() if m else ""
-        if not candidate and text.lower().strip() in {"name", "name:"} and i + 1 < len(texts):
-            candidate = _clean_label(texts[i + 1])
-        if candidate:
-            words = candidate.split()
-            if words and words[0].upper() in EN_TITLES:
-                words = words[1:]
-            if len(words) >= 2:
-                return " ".join(words[:-1]), words[-1]
-    return "", ""
+
+        surname_match = re.search(r"(?i)\b(?:Last\s*Name|Surname)\b\s*[:\-]?\s*(.*)$", text)
+        if surname_match and not surname:
+            surname = _clean_english_person_value(surname_match.group(1))
+            if not surname:
+                surname = _next_english_value(texts, i)
+
+        # Do not let "Last Name" trigger the generic Name rule.
+        if re.search(r"(?i)\b(?:Last\s*Name|Surname)\b", text):
+            continue
+
+        name_match = re.search(r"(?i)\bName\b\s*[:\-]?\s*(.*)$", text)
+        if name_match and not given:
+            candidate = name_match.group(1)
+            # Stop if surname label was merged into the same OCR line.
+            candidate = re.split(r"(?i)\b(?:Last\s*Name|Surname)\b", candidate, maxsplit=1)[0]
+            given = _clean_english_person_value(candidate)
+            if not given:
+                given = _next_english_value(texts, i)
+
+    # Fallback for cards where OCR returns a complete name in one line after Name.
+    if given and not surname:
+        words = given.split()
+        if len(words) >= 2:
+            given, surname = " ".join(words[:-1]), words[-1]
+
+    return given, surname
 
 
 def _extract_thai_name(texts: List[str]) -> Tuple[str, str]:
-    for raw in texts:
+    for i, raw in enumerate(texts):
         text = _clean_label(raw)
         for title in THAI_TITLES:
             if title in text:
@@ -39,6 +80,10 @@ def _extract_thai_name(texts: List[str]) -> Tuple[str, str]:
                 words = candidate.split()
                 if len(words) >= 2:
                     return " ".join(words[:-1]), words[-1]
+                if len(words) == 1 and i + 1 < len(texts):
+                    nxt = _clean_label(texts[i + 1])
+                    if re.fullmatch(r"[ก-๙]+", nxt):
+                        return words[0], nxt
     return "", ""
 
 
@@ -47,7 +92,7 @@ def _extract_address(texts: List[str]) -> str:
         if "ที่อยู่" in raw:
             same = raw.split("ที่อยู่", 1)[1].strip(" :")
             parts = [same] if same else []
-            for nxt in texts[i + 1 : i + 3]:
+            for nxt in texts[i + 1 : i + 4]:
                 if any(k in nxt.lower() for k in ["date of", "วันออกบัตร", "วันบัตรหมดอายุ"]):
                     break
                 parts.append(nxt.strip())
@@ -55,10 +100,45 @@ def _extract_address(texts: List[str]) -> str:
     return ""
 
 
+def _collect_unique_dates(texts: List[str]) -> List[str]:
+    found: List[str] = []
+    for text in texts:
+        parsed = parse_human_date(text)
+        if parsed and parsed not in found:
+            found.append(parsed)
+    return found
+
+
+def _extract_dates(texts: List[str]) -> Tuple[str, str, str]:
+    """Return DOB, issue date, expiry date.
+
+    Thai ID OCR frequently emits dates before their labels or in a different visual order.
+    When all three unique dates are visible, chronology is more reliable than OCR list order:
+    birth < issue < expiry.
+    """
+    dates = _collect_unique_dates(texts)
+    if len(dates) >= 3:
+        ordered = sorted(dates)
+        return ordered[0], ordered[-2], ordered[-1]
+
+    dob = first_date_near_keywords(texts, ["date of birth", "เกิด", "วันเกิด"]) or ""
+    issue = first_date_near_keywords(texts, ["date of issue", "วันออกบัตร"]) or ""
+    expiry = first_date_near_keywords(texts, ["date of expiry", "expiry", "วันบัตรหมดอายุ"]) or ""
+
+    if len(dates) == 2:
+        ordered = sorted(dates)
+        # If DOB is absent, two visible dates on an ID are typically issue and expiry.
+        if not dob:
+            issue = issue or ordered[0]
+            expiry = expiry or ordered[1]
+    return dob, issue, expiry
+
+
 def extract_thai_id(texts: List[str]) -> Tuple[Dict, List[Dict]]:
     citizen_id = find_thai_citizen_id(texts) or ""
     name_en, surname_en = _extract_english_name(texts)
     name_th, surname_th = _extract_thai_name(texts)
+    dob, issue_date, expiry_date = _extract_dates(texts)
 
     record = {
         "citizen_id": citizen_id,
@@ -66,9 +146,9 @@ def extract_thai_id(texts: List[str]) -> Tuple[Dict, List[Dict]]:
         "surname_native": surname_th,
         "name_english": name_en,
         "surname_english": surname_en,
-        "date_of_birth": first_date_near_keywords(texts, ["date of birth", "เกิด", "วันเกิด"]) or "",
-        "issue_date": first_date_near_keywords(texts, ["date of issue", "วันออกบัตร"]) or "",
-        "expiry_date": first_date_near_keywords(texts, ["date of expiry", "expiry", "วันบัตรหมดอายุ"]) or "",
+        "date_of_birth": dob,
+        "issue_date": issue_date,
+        "expiry_date": expiry_date,
         "address": _extract_address(texts),
         "thai_id_valid": bool(citizen_id and is_valid_thai_citizen_id(citizen_id)),
     }
@@ -77,6 +157,12 @@ def extract_thai_id(texts: List[str]) -> Tuple[Dict, List[Dict]]:
         issues.append({"field": "citizen_id", "value": "", "issue": "13-digit citizen ID not found"})
     elif not record["thai_id_valid"]:
         issues.append({"field": "citizen_id", "value": citizen_id, "issue": "Thai citizen ID checksum failed"})
-    if not (name_th or name_en):
-        issues.append({"field": "name", "value": "", "issue": "Name could not be extracted reliably"})
+    if not ((name_th and surname_th) or (name_en and surname_en)):
+        issues.append({"field": "name", "value": "", "issue": "Complete name could not be extracted reliably"})
+    if not dob:
+        issues.append({"field": "date_of_birth", "value": "", "issue": "Date of birth not found"})
+    if not issue_date:
+        issues.append({"field": "issue_date", "value": "", "issue": "Issue date not found"})
+    if not expiry_date:
+        issues.append({"field": "expiry_date", "value": "", "issue": "Expiry date not found"})
     return record, issues
