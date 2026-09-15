@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image, ImageOps
 from paddleocr import PaddleOCR
 
-from validation.thai_id import find_thai_citizen_id
+from validation.thai_id import find_thai_citizen_id, is_valid_thai_citizen_id
 
 
 @dataclass
@@ -196,7 +196,8 @@ def retry_thai_id_number(image: Image.Image, lines: List[OCRLine]) -> List[OCRLi
             f"thai_id_retry_{idx}",
         )
         all_retry.extend(retry)
-        if find_thai_citizen_id([x.text for x in retry]):
+        candidate = find_thai_citizen_id([x.text for x in retry])
+        if candidate and is_valid_thai_citizen_id(candidate):
             break
     return _dedupe(all_retry)
 
