@@ -37,6 +37,7 @@ def _build_model(model_key: str) -> PaddleOCR:
         use_textline_orientation=False,
         device="cpu",
         cpu_threads=4,
+        enable_mkldnn=False,
     )
     if model_key == "thai":
         return PaddleOCR(text_recognition_model_name="th_PP-OCRv5_mobile_rec", **common)
