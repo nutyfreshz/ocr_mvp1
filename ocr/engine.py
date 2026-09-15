@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional, Tuple
 import re
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 from paddleocr import PaddleOCR
+
+from validation.thai_id import find_thai_citizen_id
 
 
 @dataclass
@@ -132,6 +134,71 @@ def _dedupe(lines: List[OCRLine]) -> List[OCRLine]:
         elif line.score > chosen[key].score:
             chosen[key] = line
     return [chosen[k] for k in order]
+
+
+def _box_rect(box: list) -> Optional[Tuple[float, float, float, float]]:
+    try:
+        arr = np.asarray(box, dtype=float)
+    except Exception:
+        return None
+    if arr.ndim == 1 and arr.size >= 4:
+        x1, y1, x2, y2 = arr[:4]
+        return float(x1), float(y1), float(x2), float(y2)
+    if arr.ndim >= 2 and arr.shape[-1] >= 2:
+        xs = arr[..., 0].ravel()
+        ys = arr[..., 1].ravel()
+        return float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())
+    return None
+
+
+def _thai_id_retry_crop(image: Image.Image, lines: List[OCRLine]) -> Image.Image:
+    width, height = image.size
+    anchor = None
+    for line in lines:
+        compact = re.sub(r"[^a-z]", "", line.text.lower())
+        if "identification" in compact or "identificat" in compact or "dentification" in compact:
+            anchor = _box_rect(line.box)
+            if anchor:
+                break
+
+    if anchor:
+        _, y1, _, y2 = anchor
+        line_h = max(12.0, y2 - y1)
+        top = max(0, int(y1 - line_h * 3.0))
+        bottom = min(height, int(y2 + line_h * 2.0))
+    else:
+        # Citizen number is normally in the upper part of a Thai ID card.
+        top = 0
+        bottom = max(1, int(height * 0.42))
+
+    return image.crop((0, top, width, bottom))
+
+
+def retry_thai_id_number(image: Image.Image, lines: List[OCRLine]) -> List[OCRLine]:
+    """Retry only the Thai ID number area after checksum failure.
+
+    This is intentionally conditional so normal PASS documents do not pay the extra OCR cost.
+    """
+    crop = _thai_id_retry_crop(image, lines)
+    gray = ImageOps.grayscale(crop)
+    gray = ImageOps.autocontrast(gray)
+    scale = 3
+    large = gray.resize((gray.width * scale, gray.height * scale), Image.Resampling.LANCZOS)
+
+    variants = [large.convert("RGB")]
+    thresholded = large.point(lambda p: 255 if p > 155 else 0).convert("RGB")
+    variants.append(thresholded)
+
+    all_retry: List[OCRLine] = []
+    for idx, variant in enumerate(variants, start=1):
+        retry = _extract_lines(
+            _build_model("general").predict(np.array(variant)),
+            f"thai_id_retry_{idx}",
+        )
+        all_retry.extend(retry)
+        if find_thai_citizen_id([x.text for x in retry]):
+            break
+    return _dedupe(all_retry)
 
 
 def run_auto_ocr(image: Image.Image, include_thai_candidate: bool = True) -> OCRResult:
