@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+from difflib import SequenceMatcher
 import re
 from typing import Dict, List, Tuple
 
 from validation.common import first_date_near_keywords, parse_human_date
 from validation.thai_id import find_thai_citizen_id, is_valid_thai_citizen_id
 
-THAI_TITLES = ("นาย", "นางสาว", "นาง")
-EN_TITLES = ("MR.", "MRS.", "MISS", "MS.", "MR", "MRS", "MS")
+THAI_TITLES = ("นางสาว", "เด็กหญิง", "เด็กชาย", "น.ส.", "ด.ญ.", "ด.ช.", "น.ส", "ด.ญ", "ด.ช", "นาย", "นาง")
+EN_TITLE_PATTERN = r"(?:Mr\.?|Mrs\.?|Miss|Ms\.?|Master|Mise|Mins)"
 
 
 def _clean_label(text: str) -> str:
@@ -16,7 +17,7 @@ def _clean_label(text: str) -> str:
 
 def _clean_english_person_value(value: str) -> str:
     value = _clean_label(value).strip(" :-")
-    value = re.sub(r"(?i)^(Mr\.?|Mrs\.?|Miss|Ms\.?)\s+", "", value).strip()
+    value = re.sub(rf"(?i)^{EN_TITLE_PATTERN}\s+", "", value).strip()
     if not value:
         return ""
     if re.search(r"\d", value):
@@ -36,6 +37,26 @@ def _next_english_value(texts: List[str], index: int, max_ahead: int = 2) -> str
     return ""
 
 
+def _fuzzy_surname_label(text: str) -> Tuple[bool, str]:
+    cleaned = _clean_label(text)
+    tokens = cleaned.split()
+    if not tokens:
+        return False, ""
+
+    # Exact-ish one-word Surname remains common.
+    if SequenceMatcher(None, tokens[0].lower(), "surname").ratio() >= 0.78:
+        return True, " ".join(tokens[1:])
+
+    if len(tokens) >= 2:
+        head = " ".join(tokens[:2]).lower()
+        score = SequenceMatcher(None, head, "last name").ratio()
+        # Real samples include OCR forms such as Last nama, Laut Name, Lart Nems,
+        # Exst zame and Lest saw. Keep this low threshold scoped only to Thai-ID parsing.
+        if score >= 0.57:
+            return True, " ".join(tokens[2:])
+    return False, ""
+
+
 def _extract_english_name(texts: List[str]) -> Tuple[str, str]:
     given = ""
     surname = ""
@@ -44,25 +65,30 @@ def _extract_english_name(texts: List[str]) -> Tuple[str, str]:
         text = _clean_label(raw)
 
         surname_match = re.search(r"(?i)\b(?:Last\s*Name|Surname)\b\s*[:\-]?\s*(.*)$", text)
-        if surname_match and not surname:
-            surname = _clean_english_person_value(surname_match.group(1))
+        fuzzy_surname, fuzzy_tail = _fuzzy_surname_label(text)
+        if not surname and (surname_match or fuzzy_surname):
+            tail = surname_match.group(1) if surname_match else fuzzy_tail
+            surname = _clean_english_person_value(tail)
             if not surname:
                 surname = _next_english_value(texts, i)
 
-        # Do not let "Last Name" trigger the generic Name rule.
-        if re.search(r"(?i)\b(?:Last\s*Name|Surname)\b", text):
+        if surname_match or fuzzy_surname:
             continue
 
         name_match = re.search(r"(?i)\bName\b\s*[:\-]?\s*(.*)$", text)
         if name_match and not given:
             candidate = name_match.group(1)
-            # Stop if surname label was merged into the same OCR line.
             candidate = re.split(r"(?i)\b(?:Last\s*Name|Surname)\b", candidate, maxsplit=1)[0]
             given = _clean_english_person_value(candidate)
             if not given:
                 given = _next_english_value(texts, i)
 
-    # Fallback for cards where OCR returns a complete name in one line after Name.
+        # OCR often destroys the word "Name" but preserves the title and actual name.
+        if not given:
+            title_match = re.search(rf"(?i)\b{EN_TITLE_PATTERN}\s+([A-Za-z][A-Za-z' -]{{1,}})$", text)
+            if title_match:
+                given = _clean_english_person_value(title_match.group(1))
+
     if given and not surname:
         words = given.split()
         if len(words) >= 2:
@@ -76,7 +102,7 @@ def _extract_thai_name(texts: List[str]) -> Tuple[str, str]:
         text = _clean_label(raw)
         for title in THAI_TITLES:
             if title in text:
-                candidate = text[text.find(title) + len(title):].strip(" :")
+                candidate = text[text.find(title) + len(title):].strip(" :,.ๆ")
                 words = candidate.split()
                 if len(words) >= 2:
                     return " ".join(words[:-1]), words[-1]
@@ -125,12 +151,11 @@ def _extract_dates(texts: List[str]) -> Tuple[str, str, str]:
     issue = first_date_near_keywords(texts, ["date of issue", "วันออกบัตร"]) or ""
     expiry = first_date_near_keywords(texts, ["date of expiry", "expiry", "วันบัตรหมดอายุ"]) or ""
 
-    if len(dates) == 2:
+    if len(dates) == 2 and not dob:
+        # If birth is absent, the two complete dates visible near the bottom of an ID
+        # are overwhelmingly the issue and expiry dates. Chronology is safer than OCR order.
         ordered = sorted(dates)
-        # If DOB is absent, two visible dates on an ID are typically issue and expiry.
-        if not dob:
-            issue = issue or ordered[0]
-            expiry = expiry or ordered[1]
+        issue, expiry = ordered[0], ordered[1]
     return dob, issue, expiry
 
 
