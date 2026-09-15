@@ -1,1 +1,1 @@
-command: ['streamlit', 'run', 'app.py']
+command: ['bash', '-lc', 'python bootstrap_opencv.py && streamlit run app.py']
