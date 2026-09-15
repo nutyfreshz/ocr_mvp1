@@ -8,6 +8,9 @@ EN_MONTHS = {
     "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
     "JUL": 7, "AUG": 8, "SEP": 9, "SEPT": 9, "OCT": 10, "NOV": 11, "DEC": 12,
 }
+EN_MONTH_ALIASES = {
+    "FEH": "FEB",  # common OCR confusion: B -> H
+}
 TH_MONTHS = {
     "ม.ค.": 1, "ก.พ.": 2, "มี.ค.": 3, "เม.ย.": 4, "พ.ค.": 5, "มิ.ย.": 6,
     "ก.ค.": 7, "ส.ค.": 8, "ก.ย.": 9, "ต.ค.": 10, "พ.ย.": 11, "ธ.ค.": 12,
@@ -20,7 +23,9 @@ def parse_human_date(text: str) -> Optional[str]:
     m = re.search(r"\b(\d{1,2})[\s/.-]+([A-Za-z]{3,9})[\s/.-]+(\d{4})\b", text)
     if m:
         day, month_word, year = int(m.group(1)), m.group(2)[:4].upper().rstrip("."), int(m.group(3))
-        month = EN_MONTHS.get(month_word) or EN_MONTHS.get(month_word[:3])
+        month_key = EN_MONTH_ALIASES.get(month_word, month_word)
+        short_key = EN_MONTH_ALIASES.get(month_word[:3], month_word[:3])
+        month = EN_MONTHS.get(month_key) or EN_MONTHS.get(short_key)
         if month:
             try:
                 return datetime(year, month, day).date().isoformat()
