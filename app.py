@@ -9,8 +9,9 @@ import streamlit as st
 
 from documents.extractor import extract_document
 from export.excel import RECORD_COLUMNS, build_excel
-from ocr.engine import run_auto_ocr
+from ocr.engine import retry_thai_id_number, run_auto_ocr
 from ocr.preprocess import load_pages, normalize_image
+from validation.thai_id import is_valid_thai_citizen_id
 
 st.set_page_config(page_title="Document OCR → Excel", page_icon="📄", layout="wide")
 
@@ -22,7 +23,7 @@ with st.expander("Processing rules", expanded=False):
         """
         - Multiple files: PDF, JPG, JPEG, PNG, TIFF, BMP, WEBP
         - Auto routing: general multilingual OCR + Thai candidate model
-        - Thai Citizen ID: validates the 13-digit checksum
+        - Thai Citizen ID: validates the 13-digit checksum and retries only the number area when needed
         - Passport: reads ICAO TD3 MRZ and validates MRZ check digits
         - REVIEW means a human should check the flagged field before using the data
         - Uploaded images are processed in memory and are not persisted by this app
@@ -73,6 +74,20 @@ if run:
                 image = normalize_image(page)
                 ocr_result = run_auto_ocr(image, include_thai_candidate=True)
                 record, page_issues = extract_document(ocr_result.texts, ocr_result.mean_confidence)
+
+                # A wrong citizen number is high-risk. Retry only this region when the
+                # document is a Thai ID and the first pass does not produce a valid checksum.
+                citizen_id = record.get("citizen_id", "")
+                if record.get("document_type") == "THAI_ID" and not is_valid_thai_citizen_id(citizen_id):
+                    retry_lines = retry_thai_id_number(image, ocr_result.lines)
+                    if retry_lines:
+                        combined_texts = ocr_result.texts + [line.text for line in retry_lines]
+                        retried_record, retried_issues = extract_document(combined_texts, ocr_result.mean_confidence)
+                        retried_id = retried_record.get("citizen_id", "")
+                        ocr_result.lines.extend(retry_lines)
+                        if is_valid_thai_citizen_id(retried_id):
+                            record, page_issues = retried_record, retried_issues
+
                 record.update(
                     source_file=filename,
                     page_number=page_no,
