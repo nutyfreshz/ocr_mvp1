@@ -56,6 +56,16 @@ def detect_document_type(texts: Iterable[str]) -> str:
     ):
         return "THAI_ID"
 
+    # Some crops omit the card heading entirely but retain a distinctive cluster of
+    # Thai-ID labels. Require several signals so a generic document is not classified
+    # from one accidental phrase.
+    field_targets = ["DATE OF BIRTH", "DATE OF ISSUE", "DATE OF EXPIRY", "LAST NAME"]
+    field_hits = sum(_fuzzy_phrase_match(items, target, threshold=0.70) for target in field_targets)
+    has_thai_script = bool(re.search(r"[ก-๙]", joined))
+    thai_field_hint = any(k in joined for k in ["ที่อยู่", "วันออกบัตร", "วันบัตรหมดอายุ", "เกิดวันที่"])
+    if field_hits >= 3 or ((has_thai_script or thai_field_hint) and field_hits >= 2):
+        return "THAI_ID"
+
     if find_thai_citizen_id(items):
         return "THAI_ID"
     return "UNKNOWN"
