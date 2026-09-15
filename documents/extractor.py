@@ -7,6 +7,38 @@ from documents.passport import extract_passport
 from documents.thai_id import extract_thai_id
 
 
+def _has_complete_core_fields(doc_type: str, record: Dict) -> Tuple[bool, List[str]]:
+    missing: List[str] = []
+
+    if doc_type == "THAI_ID":
+        if not record.get("citizen_id"):
+            missing.append("citizen_id")
+        full_name = bool(
+            (record.get("name_native") and record.get("surname_native"))
+            or (record.get("name_english") and record.get("surname_english"))
+        )
+        if not full_name:
+            missing.append("name")
+        for field in ("date_of_birth", "issue_date", "expiry_date"):
+            if not record.get(field):
+                missing.append(field)
+
+    elif doc_type == "PASSPORT":
+        for field in (
+            "passport_number",
+            "name_english",
+            "surname_english",
+            "date_of_birth",
+            "expiry_date",
+            "nationality",
+            "issuing_country",
+        ):
+            if not record.get(field):
+                missing.append(field)
+
+    return not missing, missing
+
+
 def extract_document(texts: List[str], mean_confidence: float) -> Tuple[Dict, List[Dict]]:
     doc_type = detect_document_type(texts)
     base = {
@@ -45,9 +77,17 @@ def extract_document(texts: List[str], mean_confidence: float) -> Tuple[Dict, Li
     elif issues:
         confidence *= 0.8
 
+    complete, missing_fields = _has_complete_core_fields(doc_type, base)
+    existing_missing = {i.get("field") for i in issues if "not found" in i.get("issue", "").lower() or "could not be extracted" in i.get("issue", "").lower()}
+    for field in missing_fields:
+        if field not in existing_missing:
+            issues.append({"field": field, "value": base.get(field, ""), "issue": "Required core field missing"})
+
+    checksum_failed = any("checksum failed" in i.get("issue", "").lower() for i in issues)
+
     if doc_type == "UNKNOWN":
         status = "FAIL"
-    elif valid and confidence >= 0.75 and not [i for i in issues if "checksum failed" in i["issue"].lower()]:
+    elif valid and complete and confidence >= 0.75 and not checksum_failed:
         status = "PASS"
     else:
         status = "REVIEW"
